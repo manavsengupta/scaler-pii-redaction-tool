@@ -9,6 +9,7 @@ from docx import Document
 from faker import Faker
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerRegistry
 from presidio_analyzer.nlp_engine import NlpEngineProvider
+from names_dataset import NameDataset
 
 st.set_page_config(page_title="PII Redaction Tool", page_icon="🔒", layout="wide")
 
@@ -19,6 +20,10 @@ class Redactor:
         self.mp={}
         self.audit_log=[]
         
+        # load global name db (takes a couple secs to init in memory)
+        print("[~] loading names-dataset corpus...")
+        self.nd = NameDataset()
+        
         self.reg = RecognizerRegistry()
         self.reg.load_predefined_recognizers()
         self.add_patts()
@@ -27,13 +32,19 @@ class Redactor:
         prv=NlpEngineProvider(nlp_configuration=cfg)
         self.anlz=AnalyzerEngine(registry=self.reg, nlp_engine=prv.create_engine())
         
-        # spacy instance for pos checks
+        # spacy instance for grammatical pos checks
         self.nlp = self.anlz.nlp_engine.get_nlp("en")
         
+        # domain ignore terms so financial metrics and headers survive
         self.ign_terms={
             "usd", "eur", "sek", "inr", "rs", "rupees", "sebi", "icdr", "bse", "nse", "roc",
             "cagr", "ebitda", "pat", "roce", "iso", "iatf", "cin", "equity shares", "face value",
-            "fresh issue", "offer price", "floor price", "cap price", "red herring prospectus"
+            "fresh issue", "offer price", "floor price", "cap price", "red herring prospectus",
+            "for example", "email address", "phone number", "ip address", "mac address",
+            "server logs", "web site", "device encryption", "initial assessment", "in-depth synopsis",
+            "unauthorized access", "data breach", "other incidents", "revision history",
+            "containment", "possible", "detected", "time", "site", "logs", "photograph", 
+            "miscellaneous", "curt", "usage", "principals", "triage", "submission"
         }
 
     def norm_k(self, txt):
@@ -53,19 +64,39 @@ class Redactor:
         self.reg.add_recognizer(PatternRecognizer(supported_entity="IP_ADDRESS", patterns=[p5]))
         p6=Pattern(name="dob", regex=r"\b(0[1-9]|[12][0-9]|3[01])[- /.](0[1-9]|1[012])[- /.](19|20)\d\d\b", score=0.80)
         self.reg.add_recognizer(PatternRecognizer(supported_entity="DATE_OF_BIRTH", patterns=[p6]))
-        p7=Pattern(name="org_ltd", regex=r"\b[A-Z][a-zA-Z0-9\s]+(?:Limited|Ltd\.|LLP|Private Limited|Pvt\.? Ltd\.?|Corporation|Inc\.?)\b", score=0.95)
+        
+        # non-greedy company regex (stops it from swallowing 15-word sentences ending in Limited!)
+        p7=Pattern(name="org_ltd", regex=r"\b(?:[A-Z0-9][a-zA-Z0-9&_\.\-]+)(?:\s+(?:[A-Z0-9][a-zA-Z0-9&_\.\-]+|and|of|for|&|AND|OF|FOR)){0,6}\s+(?:[Ll]imited|LIMITED|[Ll]td\.|LTD\.|LLP|[Pp]rivate\s+[Ll]imited|PRIVATE\s+LIMITED|[Pp]vt\.?\s*[Ll]td\.?|[Cc]orporation|CORPORATION|[Ii]nc\.?|INC\.?)\b", score=0.95)
         self.reg.add_recognizer(PatternRecognizer(supported_entity="ORG", patterns=[p7]))
+        
+        # pattern to anchor indian 6-digit pin codes
+        p8=Pattern(name="in_pin", regex=r"\b[1-8]\d{5}\b", score=0.80)
+        self.reg.add_recognizer(PatternRecognizer(supported_entity="IN_PINCODE", patterns=[p8]))
 
-    def is_false_person(self, raw_str):
-        # spacy pos tag filter to drop verbs and random stop words
+    def is_real_person(self, raw_str):
+        # 1. first check our offline name db (using 'or {}' so None values dont crash)
+        tokens = re.findall(r"\b[a-zA-Z]+\b", raw_str)
+        if tokens:
+            for tok in tokens:
+                search_res = self.nd.search(tok) or {}
+                fn_dict = search_res.get("first_name") or {}
+                ln_dict = search_res.get("last_name") or {}
+                
+                in_fn = (fn_dict.get("country") or {}).get("IN", 0) > 0.001
+                in_ln = (ln_dict.get("country") or {}).get("IN", 0) > 0.001
+                us_fn = (fn_dict.get("country") or {}).get("US", 0) > 0.005
+                us_ln = (ln_dict.get("country") or {}).get("US", 0) > 0.005
+                
+                if(in_fn or in_ln or us_fn or us_ln):
+                    return True # definitely a human name!
+
+        # 2. fallback to spacy pos checking to drop verbs/prepositions
         doc=self.nlp(raw_str)
         for t in doc:
             if(t.is_stop or t.pos_ in ["VERB", "ADP", "DET", "CCONJ", "PRON", "AUX"]):
-                return True
+                return False
         has_prop = any(t.pos_ == "PROPN" or t.shape_.startswith("X") for t in doc)
-        if not has_prop:
-            return True
-        return False
+        return has_prop
 
     def get_val(self, etype, txt):
         nk=self.norm_k(txt)
@@ -93,10 +124,16 @@ class Redactor:
                 res=res.upper()
         elif(etype in ["LOCATION", "ADDRESS", "IN_ADDRESS"]):
             res=f"{self.fk.building_number()}, {self.fk.street_name()}, {self.fk.city()} - {self.fk.postcode()}"
+        elif(etype=="IN_PINCODE"):
+            # native check for valid indian postal range (starts with 1-8, exactly 6 digits)
+            if(re.match(r"^[1-8]\d{5}$", txt)):
+                res = str(self.fk.random_int(110001, 800001))
+            else:
+                res=txt
         elif(etype=="US_SSN"):
             res=self.fk.ssn()
         elif(etype=="IN_AADHAAR"):
-            res=f"{self.fk.random_int(1000,9999)} {self.fk.random_int(1000,9999)} {self.fk.random_int(1000,9999)}"
+            res="[Aadhaar Redacted]"
         elif(etype=="IN_PAN"):
             res=self.fk.lexify('?????').upper()+self.fk.numerify('####')+self.fk.lexify('?').upper()
         elif(etype=="CREDIT_CARD"):
@@ -115,10 +152,10 @@ class Redactor:
         if not txt.strip():
             return txt
             
-        ent_types=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IN_PHONE", "ORG", "LOCATION", "US_SSN", "IN_AADHAAR", "IN_PAN", "CREDIT_CARD", "DATE_OF_BIRTH", "IP_ADDRESS"]
+        ent_types=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IN_PHONE", "ORG", "LOCATION", "US_SSN", "IN_AADHAAR", "IN_PAN", "CREDIT_CARD", "DATE_OF_BIRTH", "IP_ADDRESS", "IN_PINCODE"]
         res_normal=self.anlz.analyze(text=txt, entities=ent_types, language="en")
         
-        # only run shadow parser if string is strictly all caps
+        # shadow parse title-case only for all caps text
         res_shadow=[]
         if(txt.isupper() and len(txt.split())>1):
             res_shadow=self.anlz.analyze(text=txt.title(), entities=["PERSON", "ORG"], language="en")
@@ -141,12 +178,12 @@ class Redactor:
             if(len(nk)<=2 and r.entity_type not in ["IN_PAN", "IN_PHONE"]):
                 continue
                 
-            # dynamic check to drop false names
-            if(r.entity_type=="PERSON" and self.is_false_person(old)):
+            # upgraded name verification: checks names-dataset FIRST, then spacy pos
+            if(r.entity_type=="PERSON" and not self.is_real_person(old)):
                 continue
                 
             win=txt[max(0, r.start-20):min(len(txt), r.end+20)].lower()
-            if(any(w in win for w in ign_ctx) and r.entity_type in ["DATE_OF_BIRTH", "IN_PHONE", "US_SSN"]):
+            if(any(w in win for w in ign_ctx) and r.entity_type in ["DATE_OF_BIRTH", "IN_PHONE", "US_SSN", "IN_PINCODE"]):
                 continue
                     
             flt.append(r)
