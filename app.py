@@ -27,21 +27,19 @@ class Redactor:
         prv=NlpEngineProvider(nlp_configuration=cfg)
         self.anlz=AnalyzerEngine(registry=self.reg, nlp_engine=prv.create_engine())
         
-        # ignore list so standard business words dont get replaced
-        self.ign_words={
-            "usd", "eur", "sek", "inr", "rs", "rupees", "united states", "india", 
-            "republic of india", "section", "chapter", "prospectus", "red herring", 
-            "offer", "table", "iatf", "iso", "sebi", "icdr", "bse", "nse", "roc", 
-            "cagr", "ebitda", "pat", "roce", "risk factors", "general information",
-            "capital structure", "terms of the offer", "offer structure", "bse limited",
-            "national stock exchange", "companies act", "income tax", "goods and services",
-            "equity shares", "face value", "fresh issue", "promoter selling", "total offer",
-            "floor price", "cap price", "offer price", "book building", "working days",
-            "public offer", "net proceeds", "gross proceeds", "paid-up", "share capital",
-            "definitions and abbreviations", "forward-looking statements", "summary financial",
-            "summary of the offer", "corporate identity number", "please scan this qr code",
-            "our promoters", "promoter group", "private limited", "public limited", 
-            "public limited company", "private limited company", "limited liability partnership"
+        # get spacy instance directly from presidio to check pos tags
+        self.nlp = self.anlz.nlp_engine.get_nlp("en")
+        
+        # domain terms so headers and finance words dont get swapped
+        self.ign_terms={
+            "usd", "eur", "sek", "inr", "rs", "rupees", "sebi", "icdr", "bse", "nse", "roc",
+            "cagr", "ebitda", "pat", "roce", "iso", "iatf", "cin", "equity shares", "face value",
+            "fresh issue", "offer price", "floor price", "cap price", "red herring prospectus",
+            "for example", "email address", "phone number", "ip address", "mac address",
+            "server logs", "web site", "device encryption", "initial assessment", "in-depth synopsis",
+            "unauthorized access", "data breach", "other incidents", "revision history",
+            "containment", "possible", "detected", "time", "site", "logs", "photograph", 
+            "miscellaneous", "curt", "usage", "principals", "triage", "submission"
         }
 
     def norm_k(self, txt):
@@ -49,8 +47,6 @@ class Redactor:
         return re.sub(r"\s+", " ", cl)
 
     def add_patts(self):
-        p0=Pattern(name="log_name", regex=r"\b([A-Z][a-z]+\s[A-Z][a-z]+)(?=\s*:)", score=0.90)
-        self.reg.add_recognizer(PatternRecognizer(supported_entity="PERSON", patterns=[p0]))
         p1=Pattern(name="in_phone", regex=r"(?<!\d)(?:\+91[\-\s]?)?[6-9]\d{9}(?!\d)", score=0.85)
         self.reg.add_recognizer(PatternRecognizer(supported_entity="IN_PHONE", patterns=[p1]))
         p2=Pattern(name="aadhaar", regex=r"\b\d{4}\s?\d{4}\s?\d{4}\b", score=0.85)
@@ -65,6 +61,17 @@ class Redactor:
         self.reg.add_recognizer(PatternRecognizer(supported_entity="DATE_OF_BIRTH", patterns=[p6]))
         p7=Pattern(name="org_ltd", regex=r"\b[A-Z][a-zA-Z0-9\s]+(?:Limited|Ltd\.|LLP|Private Limited|Pvt\.? Ltd\.?|Corporation|Inc\.?)\b", score=0.95)
         self.reg.add_recognizer(PatternRecognizer(supported_entity="ORG", patterns=[p7]))
+
+    def is_false_person(self, raw_str):
+        # check tokens if text is actually common nouns or verbs
+        doc = self.nlp(raw_str)
+        for t in doc:
+            if t.is_stop or t.pos_ in ["VERB", "ADP", "DET", "CCONJ", "PRON", "AUX"]:
+                return True
+        has_prop = any(t.pos_ == "PROPN" or t.shape_.startswith("X") for t in doc)
+        if not has_prop:
+            return True
+        return False
 
     def get_val(self, etype, txt):
         nk=self.norm_k(txt)
@@ -117,14 +124,18 @@ class Redactor:
             
         ent_types=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IN_PHONE", "ORG", "LOCATION", "US_SSN", "IN_AADHAAR", "IN_PAN", "CREDIT_CARD", "DATE_OF_BIRTH", "IP_ADDRESS"]
         res_normal=self.anlz.analyze(text=txt, entities=ent_types, language="en")
-        res_shadow=self.anlz.analyze(text=txt.title(), entities=["PERSON", "ORG"], language="en")
+        
+        # only run shadow title-case if text is strictly all-caps (stops "for example:" bugs)
+        res_shadow=[]
+        if(txt.isupper() and len(txt.split())>1):
+            res_shadow=self.anlz.analyze(text=txt.title(), entities=["PERSON", "ORG"], language="en")
         
         all_res=res_normal+res_shadow
         all_res.sort(key=lambda x: (x.start, -x.end))
         
         flt=[]
         last_end=-1
-        ign_ctx=["ticket", "order", "iso", "form", "section", "regulation", "cin", "iatf", "clause", "rule", "page", "table", "note"]
+        ign_ctx=["ticket", "order", "iso", "form", "section", "regulation", "cin", "iatf", "clause", "rule", "page", "table", "version"]
         
         for r in all_res:
             if(r.start<last_end):
@@ -132,18 +143,18 @@ class Redactor:
             old=txt[r.start:r.end]
             nk=self.norm_k(old)
             
-            if(nk in self.ign_words or any(iw in nk for iw in self.ign_words if len(iw)>4)):
+            if(nk in self.ign_terms):
                 continue
             if(len(nk)<=2 and r.entity_type not in ["IN_PAN", "IN_PHONE"]):
                 continue
-            if(r.entity_type=="ORG" and any(gen in nk for gen in ["public limited", "private limited", "company", "limited liability"]) and len(nk.split())<=4):
-                if not any(char.isupper() for char in old[1:3]):
-                    continue
+                
+            # pos check to kill false person names
+            if(r.entity_type=="PERSON" and self.is_false_person(old)):
+                continue
                 
             win=txt[max(0, r.start-20):min(len(txt), r.end+20)].lower()
-            if(any(w in win for w in ign_ctx) and r.entity_type in ["DATE_OF_BIRTH", "IN_PHONE", "US_SSN", "PERSON"]):
-                if(any(w in win for w in ["section", "iatf", "iso", "page", "rule", "table"])):
-                    continue
+            if(any(w in win for w in ign_ctx) and r.entity_type in ["DATE_OF_BIRTH", "IN_PHONE", "US_SSN"]):
+                continue
                     
             flt.append(r)
             last_end=r.end
