@@ -32,15 +32,77 @@ class Redactor:
         self.nlp = self.anlz.nlp_engine.get_nlp("en")
         
         # domain ignore terms so financial metrics and headers survive
-        self.ign_terms={
-            "usd", "eur", "sek", "inr", "rs", "rupees", "sebi", "icdr", "bse", "nse", "roc",
-            "cagr", "ebitda", "pat", "roce", "iso", "iatf", "cin", "equity shares", "face value",
-            "fresh issue", "offer price", "floor price", "cap price", "red herring prospectus",
-            "for example", "email address", "phone number", "ip address", "mac address",
-            "server logs", "web site", "device encryption", "initial assessment", "in-depth synopsis",
-            "unauthorized access", "data breach", "other incidents", "revision history",
-            "containment", "possible", "detected", "time", "site", "logs", "photograph", 
-            "miscellaneous", "curt", "usage", "principals", "triage", "submission"
+        # massive shield of ignore terms to stop false positives on headers, legal docs, finance & IT words
+        self.ign_terms = {
+            # currencies & units
+            "usd", "eur", "sek", "inr", "rs", "rupees", "dollar", "dollars", "euro", "euros", "krona", 
+            "cents", "paise", "lakh", "lakhs", "crore", "crores", "million", "billion", "trillion", 
+            "mt", "metric ton", "sqft", "sq mtr", "kwh", "gw", "gwh", "mw", "mva", "kv", "lt", "ht",
+
+            # regulatory & statutory bodies
+            "sebi", "rbi", "mca", "roc", "bse", "nse", "cdsl", "nsdl", "rdss", "uidai", "dgft", "dpiit", 
+            "cerc", "fbil", "npci", "sbi", "hdfc", "icici", "ibbi", "irdai", "pfrda", "nhai", "mpcb", "msedcl",
+            "iatf", "iso", "ul", "bis", "iea", "imf", "weo", "oem", "oems",
+
+            # financial, accounting & valuation terms
+            "cagr", "ebitda", "ebit", "pat", "roce", "roe", "rodep", "meis", "epcg", "pli", "kpi", 
+            "gaap", "ind as", "ifrs", "us gaap", "indian gaap", "ind as 24", "net worth", "nav", 
+            "gross proceeds", "net proceeds", "working capital", "cash flow", "balance sheet", 
+            "profit and loss", "p&l", "assets", "liabilities", "depreciation", "amortization", 
+            "taxation", "income tax", "gst", "stt", "customs duty", "basic custom duty", "turnover",
+            "paid-up", "share capital", "equity shares", "face value", "fresh issue", "bonus issue",
+            "split of equity shares", "dividend", "reserves and surplus", "trade receivables", "trade payables",
+
+            # corporate & legal document names
+            "prospectus", "red herring prospectus", "drhp", "rhp", "ipo", "fpo", "offer for sale", "ofs", 
+            "book building", "price band", "floor price", "cap price", "cut-off price", "bid lot", "offer price",
+            "asba", "upi", "can", "allotment advice", "escrow account", "refund account", "public offer account",
+            "memorandum of association", "moa", "articles of association", "aoa", "power of attorney", "poa", 
+            "certificate of incorporation", "board resolution", "special resolution", "ordinary resolution", 
+            "annual return", "audit report", "valuation report", "consent letter", "agreement", "contract", 
+            "deed", "indemnity", "undertaking", "affidavit", "notice", "agenda", "minutes", "terms of the offer",
+            "offer structure", "general information", "capital structure", "industry overview", "risk factors",
+            "forward-looking statements", "definitions and abbreviations", "summary of the offer",
+
+            # corporate roles, departments & entities (when standalone)
+            "board of directors", "board", "committee", "audit committee", "ipo committee", 
+            "stakeholders relationship committee", "nomination and remuneration committee", "csr committee", 
+            "risk management committee", "chairman", "managing director", "whole-time director", 
+            "executive director", "independent director", "chief executive officer", "ceo", 
+            "chief financial officer", "cfo", "company secretary", "compliance officer", "kmp", 
+            "senior management", "promoter", "promoter group", "selling shareholder", "underwriter", 
+            "syndicate member", "book running lead manager", "brlm", "registrar to the offer", 
+            "statutory auditor", "internal auditor", "secretarial auditor", "legal counsel", "promoters",
+            "private limited", "public limited", "public limited company", "private limited company", 
+            "limited liability partnership", "llp", "company", "corporation", "limited", "ltd",
+
+            # form labels, contact details & incident headers
+            "email", "e-mail", "email address", "phone", "phone number", "telephone", "tel", "mobile", "mob", 
+            "fax", "website", "web site", "url", "ip address", "mac address", "device encryption", 
+            "encryption key", "operating system", "os", "firmware", "property tag", "serial number", 
+            "ticket", "order", "form", "section", "chapter", "clause", "rule", "regulation", "page", 
+            "table", "note", "annexure", "schedule", "appendix", "exhibit", "part", "volume", "issue", 
+            "version", "date", "timestamp", "description", "short description", "brief synopsis", 
+            "in-depth synopsis", "initial assessment", "triage", "usage", "principals", "supervisor", 
+            "department", "office location", "job title", "availability", "submission", "revision history",
+            "contact person", "registered office", "corporate office", "details", "particulars",
+
+            # IT security & incident terms
+            "malware", "phishing", "ransomware", "attachment", "browser", "payload", "shared storage", 
+            "usb drive", "network share", "anti-virus", "runtime protection", "periodic scan", "infestation", 
+            "quarantine", "unauthorized access", "data breach", "credentials", "login", "password", "pin", 
+            "certificate", "private key", "public key", "encryption", "decryption", "firewall", "gateway", 
+            "server", "client", "endpoint", "router", "switch", "ethernet", "vpn", "wireless", "wi-fi", 
+            "isp", "public network", "server logs", "client logs", "audit trails", "browser history",
+
+            # common nouns, verbs & prepositions that trip up title-case NER
+            "for example", "example", "examples", "was detected", "detected", "detection", "of time", 
+            "time", "timeline", "timeframe", "on containment", "containment", "miscellaneous", "misc", 
+            "photograph", "photo", "image", "curt", "brief", "general", "specific", "total", "aggregate", 
+            "average", "weighted average", "approximate", "approx", "maximum", "max", "minimum", "min", 
+            "balance", "remainder", "overview", "summary", "introduction", "background", "history", 
+            "status", "remarks", "comments", "notes", "references", "others", "nil", "na", "n.a.", 
+            "none", "applicable", "not applicable", "yes", "no", "true", "false", "item", "items"
         }
 
     def norm_k(self, txt):
