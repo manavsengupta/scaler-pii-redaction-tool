@@ -27,19 +27,13 @@ class Redactor:
         prv=NlpEngineProvider(nlp_configuration=cfg)
         self.anlz=AnalyzerEngine(registry=self.reg, nlp_engine=prv.create_engine())
         
-        # get spacy instance directly from presidio to check pos tags
+        # spacy instance for pos checks
         self.nlp = self.anlz.nlp_engine.get_nlp("en")
         
-        # domain terms so headers and finance words dont get swapped
         self.ign_terms={
             "usd", "eur", "sek", "inr", "rs", "rupees", "sebi", "icdr", "bse", "nse", "roc",
             "cagr", "ebitda", "pat", "roce", "iso", "iatf", "cin", "equity shares", "face value",
-            "fresh issue", "offer price", "floor price", "cap price", "red herring prospectus",
-            "for example", "email address", "phone number", "ip address", "mac address",
-            "server logs", "web site", "device encryption", "initial assessment", "in-depth synopsis",
-            "unauthorized access", "data breach", "other incidents", "revision history",
-            "containment", "possible", "detected", "time", "site", "logs", "photograph", 
-            "miscellaneous", "curt", "usage", "principals", "triage", "submission"
+            "fresh issue", "offer price", "floor price", "cap price", "red herring prospectus"
         }
 
     def norm_k(self, txt):
@@ -63,10 +57,10 @@ class Redactor:
         self.reg.add_recognizer(PatternRecognizer(supported_entity="ORG", patterns=[p7]))
 
     def is_false_person(self, raw_str):
-        # check tokens if text is actually common nouns or verbs
-        doc = self.nlp(raw_str)
+        # spacy pos tag filter to drop verbs and random stop words
+        doc=self.nlp(raw_str)
         for t in doc:
-            if t.is_stop or t.pos_ in ["VERB", "ADP", "DET", "CCONJ", "PRON", "AUX"]:
+            if(t.is_stop or t.pos_ in ["VERB", "ADP", "DET", "CCONJ", "PRON", "AUX"]):
                 return True
         has_prop = any(t.pos_ == "PROPN" or t.shape_.startswith("X") for t in doc)
         if not has_prop:
@@ -78,7 +72,6 @@ class Redactor:
         if(nk in self.mp):
             return self.mp[nk]
             
-        # check if word is child of existing mapped company so it stays same
         if(etype in ["ORG", "PERSON"] and len(nk)>4):
             for ex_k, ex_val in self.mp.items():
                 if(nk in ex_k or ex_k in nk):
@@ -125,7 +118,7 @@ class Redactor:
         ent_types=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IN_PHONE", "ORG", "LOCATION", "US_SSN", "IN_AADHAAR", "IN_PAN", "CREDIT_CARD", "DATE_OF_BIRTH", "IP_ADDRESS"]
         res_normal=self.anlz.analyze(text=txt, entities=ent_types, language="en")
         
-        # only run shadow title-case if text is strictly all-caps (stops "for example:" bugs)
+        # only run shadow parser if string is strictly all caps
         res_shadow=[]
         if(txt.isupper() and len(txt.split())>1):
             res_shadow=self.anlz.analyze(text=txt.title(), entities=["PERSON", "ORG"], language="en")
@@ -148,7 +141,7 @@ class Redactor:
             if(len(nk)<=2 and r.entity_type not in ["IN_PAN", "IN_PHONE"]):
                 continue
                 
-            # pos check to kill false person names
+            # dynamic check to drop false names
             if(r.entity_type=="PERSON" and self.is_false_person(old)):
                 continue
                 
@@ -189,19 +182,17 @@ class Redactor:
         doc.save(outp)
 
 
-# ui starts here
+# ui layout
 st.title("🔒 PII Redaction Tool")
 st.subheader("Manav Sengupta - Scaler AI Labs Assignment")
 st.caption("upload docx file below to clean private info and download audit logs")
 
-# using session state so download button clicks dont wipe the screen
 if 'done' not in st.session_state:
     st.session_state.done=False
 
 up_file = st.file_uploader("Select DOCX File", type=["docx"])
 
 if up_file is not None:
-    # if user selects a different file then reset
     if 'last_file' not in st.session_state or st.session_state.last_file != up_file.name:
         st.session_state.done=False
         st.session_state.last_file=up_file.name
@@ -236,7 +227,6 @@ if up_file is not None:
                     st.session_state.done=True
                     st.rerun()
 
-    # show download buttons only after processing is done
     if st.session_state.done:
         st.success("done processing!")
         
@@ -258,7 +248,7 @@ if up_file is not None:
                 use_container_width=True
             )
         
-        st.write("") # spacing
+        st.write("")
         if st.button("🔄 Upload New File / Reset"):
             st.session_state.done=False
             st.rerun()
