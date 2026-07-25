@@ -22,20 +22,14 @@ class Redactor:
         prv = NlpEngineProvider(nlp_configuration=cfg)
         self.anlz = AnalyzerEngine(registry=self.reg, nlp_engine=prv.create_engine())
         
-        self.ign_words = {
-            "usd", "eur", "sek", "inr", "rs", "rupees", "united states", "india", 
-            "republic of india", "section", "chapter", "prospectus", "red herring", 
-            "offer", "table", "iatf", "iso", "sebi", "icdr", "bse", "nse", "roc", 
-            "cagr", "ebitda", "pat", "roce", "risk factors", "general information",
-            "capital structure", "terms of the offer", "offer structure", "bse limited",
-            "national stock exchange", "companies act", "income tax", "goods and services",
-            "equity shares", "face value", "fresh issue", "promoter selling", "total offer",
-            "floor price", "cap price", "offer price", "book building", "working days",
-            "public offer", "net proceeds", "gross proceeds", "paid-up", "share capital",
-            "definitions and abbreviations", "forward-looking statements", "summary financial",
-            "summary of the offer", "corporate identity number", "please scan this qr code",
-            "our promoters", "promoter group", "private limited", "public limited", 
-            "public limited company", "private limited company", "limited liability partnership"
+        # grab spacy nlp instance directly from presidio to do pos/vocab checks
+        self.nlp = self.anlz.nlp_engine.get_nlp("en")
+        
+        # minimal domain stop words for prospectus headers and financial terms
+        self.ign_terms = {
+            "usd", "eur", "sek", "inr", "rs", "rupees", "sebi", "icdr", "bse", "nse", "roc",
+            "cagr", "ebitda", "pat", "roce", "iso", "iatf", "cin", "equity shares", "face value",
+            "fresh issue", "offer price", "floor price", "cap price", "red herring prospectus"
         }
 
     def norm_k(self, txt):
@@ -43,8 +37,6 @@ class Redactor:
         return re.sub(r"\s+", " ", cl)
 
     def add_patts(self):
-        p0 = Pattern(name="log_name", regex=r"\b([A-Z][a-z]+\s[A-Z][a-z]+)(?=\s*:)", score=0.90)
-        self.reg.add_recognizer(PatternRecognizer(supported_entity="PERSON", patterns=[p0]))
         p1 = Pattern(name="in_phone", regex=r"(?<!\d)(?:\+91[\-\s]?)?[6-9]\d{9}(?!\d)", score=0.85)
         self.reg.add_recognizer(PatternRecognizer(supported_entity="IN_PHONE", patterns=[p1]))
         p2 = Pattern(name="aadhaar", regex=r"\b\d{4}\s?\d{4}\s?\d{4}\b", score=0.85)
@@ -60,11 +52,28 @@ class Redactor:
         p7 = Pattern(name="org_ltd", regex=r"\b[A-Z][a-zA-Z0-9\s]+(?:Limited|Ltd\.|LLP|Private Limited|Pvt\.? Ltd\.?|Corporation|Inc\.?)\b", score=0.95)
         self.reg.add_recognizer(PatternRecognizer(supported_entity="ORG", patterns=[p7]))
 
+    def is_false_person(self, raw_str):
+        # check via spacy tokens if text is actually common nouns/verbs/stop words
+        doc = self.nlp(raw_str)
+        
+        # if any token is a stop word or common preposition/verb, it's not a real person name
+        for t in doc:
+            if t.is_stop or t.pos_ in ["VERB", "ADP", "DET", "CCONJ", "PRON", "AUX"]:
+                return True
+        
+        # if none of the tokens are proper nouns or capitalised words, skip
+        has_prop = any(t.pos_ == "PROPN" or t.shape_.startswith("X") for t in doc)
+        if not has_prop:
+            return True
+            
+        return False
+
     def get_val(self, etype, txt):
         nk = self.norm_k(txt)
         if nk in self.mp:
             return self.mp[nk]
             
+        # substring check so variations of company/name stay consistent
         if etype in ["ORG", "PERSON"] and len(nk) > 4:
             for ex_k, ex_val in self.mp.items():
                 if nk in ex_k or ex_k in nk:
@@ -110,14 +119,18 @@ class Redactor:
             
         ent_types = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IN_PHONE", "ORG", "LOCATION", "US_SSN", "IN_AADHAAR", "IN_PAN", "CREDIT_CARD", "DATE_OF_BIRTH", "IP_ADDRESS"]
         res_normal = self.anlz.analyze(text=txt, entities=ent_types, language="en")
-        res_shadow = self.anlz.analyze(text=txt.title(), entities=["PERSON", "ORG"], language="en")
+        
+        # only run title-case shadow parser if text is strictly ALL-CAPS (prevents "for example" bugs)
+        res_shadow = []
+        if txt.isupper() and len(txt.split()) > 1:
+            res_shadow = self.anlz.analyze(text=txt.title(), entities=["PERSON", "ORG"], language="en")
         
         all_res = res_normal + res_shadow
         all_res.sort(key=lambda x: (x.start, -x.end))
         
         flt = []
         last_end = -1
-        ign_ctx = ["ticket", "order", "iso", "form", "section", "regulation", "cin", "iatf", "clause", "rule", "page", "table", "note"]
+        ign_ctx = ["ticket", "order", "iso", "form", "section", "regulation", "cin", "iatf", "clause", "rule", "page", "table", "version"]
         
         for r in all_res:
             if r.start < last_end:
@@ -125,18 +138,20 @@ class Redactor:
             old = txt[r.start:r.end]
             nk = self.norm_k(old)
             
-            if nk in self.ign_words or any(iw in nk for iw in self.ign_words if len(iw) > 4):
+            # domain term filter
+            if nk in self.ign_terms:
                 continue
             if len(nk) <= 2 and r.entity_type not in ["IN_PAN", "IN_PHONE"]:
                 continue
-            if r.entity_type == "ORG" and any(gen in nk for gen in ["public limited", "private limited", "company", "limited liability"]) and len(nk.split()) <= 4:
-                if not any(char.isupper() for char in old[1:3]):
-                    continue
                 
+            # dynamic spacy pos check to kill false person names
+            if r.entity_type == "PERSON" and self.is_false_person(old):
+                continue
+                
+            # operational context check
             win = txt[max(0, r.start-20):min(len(txt), r.end+20)].lower()
-            if any(w in win for w in ign_ctx) and r.entity_type in ["DATE_OF_BIRTH", "IN_PHONE", "US_SSN", "PERSON"]:
-                if any(w in win for w in ["section", "iatf", "iso", "page", "rule", "table"]):
-                    continue
+            if any(w in win for w in ign_ctx) and r.entity_type in ["DATE_OF_BIRTH", "IN_PHONE", "US_SSN"]:
+                continue
                     
             flt.append(r)
             last_end = r.end
@@ -158,7 +173,6 @@ class Redactor:
         return txt
 
     def run_docx(self, inp, outp):
-        print(f"[~] Ingesting document: {inp}...")
         doc = Document(inp)
         for p in doc.paragraphs:
             if p.text:
@@ -170,7 +184,6 @@ class Redactor:
                         if p.text:
                             p.text = self.proc_txt(p.text)
         doc.save(outp)
-        print(f"[+] Successfully saved redacted document to: {outp}")
         self.export_audit()
 
     def export_audit(self):
@@ -179,8 +192,6 @@ class Redactor:
         df = pd.DataFrame(self.audit_log).drop_duplicates(subset=["Original Text", "Entity Type"])
         filename = f"Redaction_Audit_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         df.to_csv(filename, index=False)
-        print(f"[+] Automated Audit & Evaluation Report generated: {filename}")
-        print(f"[+] Total Unique PII Entities Processed: {len(df)}")
 
 if __name__ == "__main__":
     obj = Redactor()
